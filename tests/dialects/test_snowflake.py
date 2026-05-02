@@ -7254,3 +7254,62 @@ FROM SEMANTIC_VIEW(
                     prefix = natural + join_side + outer + " DIRECTED"
                     with self.subTest(f"Testing {prefix} JOIN"):
                         self.validate_identity(f"SELECT * FROM a {prefix} JOIN b USING (id)")
+
+    def test_qmark_cast_shorthand(self):
+        # ``?::TYPE`` is the qmark placeholder + immediate cast shorthand emitted by
+        # positional-bind drivers (Node SDK, various Postgres-shape clients).
+        # Verify it parses to ``CAST(? AS TYPE)`` for a range of type spellings.
+        self.validate_identity("SELECT ?::TIMESTAMP", "SELECT CAST(? AS TIMESTAMP)")
+        self.validate_identity("SELECT ?::TIMESTAMP_LTZ", "SELECT CAST(? AS TIMESTAMPLTZ)")
+        self.validate_identity("SELECT ?::TIMESTAMP_NTZ(9)", "SELECT CAST(? AS TIMESTAMPNTZ(9))")
+        self.validate_identity("SELECT ?::NUMBER(38, 0)", "SELECT CAST(? AS DECIMAL(38, 0))")
+        self.validate_identity("SELECT ?::VARCHAR", "SELECT CAST(? AS VARCHAR)")
+        self.validate_identity("SELECT ?::VARIANT", "SELECT CAST(? AS VARIANT)")
+
+        # Verify AST shape: Cast(Placeholder(), DataType(...))
+        ast = parse_one("SELECT ?::TIMESTAMP", read="snowflake")
+        cast = ast.expressions[0]
+        self.assertIsInstance(cast, exp.Cast)
+        self.assertIsInstance(cast.this, exp.Placeholder)
+        self.assertTrue(cast.to.is_type(exp.DType.TIMESTAMP))
+
+        # Equivalent to the canonical CAST(? AS TYPE) form
+        canonical = parse_one("SELECT CAST(? AS TIMESTAMP)", read="snowflake")
+        self.assertEqual(ast.sql(dialect="snowflake"), canonical.sql(dialect="snowflake"))
+
+        # Multiple placeholders + casts in the same statement
+        self.validate_identity(
+            "SELECT ?::TIMESTAMP, ?::INT FROM t",
+            "SELECT CAST(? AS TIMESTAMP), CAST(? AS INT) FROM t",
+        )
+
+        # Inside larger expressions
+        self.validate_identity(
+            "SELECT * FROM t WHERE ts > ?::TIMESTAMP",
+            "SELECT * FROM t WHERE ts > CAST(? AS TIMESTAMP)",
+        )
+
+        # Cross-dialect emission: parse as snowflake, emit as duckdb / postgres
+        self.validate_all(
+            "SELECT CAST(? AS TIMESTAMP)",
+            read={"snowflake": "SELECT ?::TIMESTAMP"},
+            write={
+                "snowflake": "SELECT CAST(? AS TIMESTAMP)",
+                "duckdb": "SELECT CAST(? AS TIMESTAMP)",
+                "postgres": "SELECT CAST(%s AS TIMESTAMP)",
+            },
+        )
+
+        # Regression: numeric paramstyle (PR #5008) + cast must still parse and
+        # produce the same shape with a numbered placeholder.
+        ast = parse_one("SELECT :1::TIMESTAMP", read="snowflake")
+        cast = ast.expressions[0]
+        self.assertIsInstance(cast, exp.Cast)
+        self.assertIsInstance(cast.this, exp.Placeholder)
+        self.assertEqual(str(cast.this.this), "1")
+
+        # Regression: bare ? and bare :name still produce a plain Placeholder
+        ast = parse_one("SELECT ?", read="snowflake")
+        self.assertIsInstance(ast.expressions[0], exp.Placeholder)
+        ast = parse_one("SELECT :name", read="snowflake")
+        self.assertIsInstance(ast.expressions[0], exp.Placeholder)

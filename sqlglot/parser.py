@@ -1169,6 +1169,7 @@ class Parser:
         TokenType.FALSE: lambda self, _: self.expression(exp.Boolean(this=False)),
         TokenType.SESSION_PARAMETER: lambda self, _: self._parse_session_parameter(),
         TokenType.STAR: lambda self, _: self._parse_star_ops(),
+        TokenType.QDCOLON: lambda self, _: self._parse_qdcolon_placeholder_cast(),
     }
 
     PLACEHOLDER_PARSERS: t.ClassVar = {
@@ -8380,6 +8381,28 @@ class Parser:
                 return placeholder
             self._advance(-1)
         return None
+
+    def _parse_qdcolon_placeholder_cast(self) -> exp.Expr:
+        """Handle the ``?::TYPE`` shorthand (qmark placeholder + immediate cast).
+
+        The tokenizer fuses ``?``, ``:`` and ``:`` into a single ``QDCOLON`` token, so
+        the regular ``_parse_placeholder`` / ``_parse_column_ops`` path can't apply
+        the postfix cast on its own. We synthesize a Placeholder for the ``?`` part
+        and parse the type that follows. If the dialect overrides
+        ``COLUMN_OPERATORS[QDCOLON]`` (e.g. Databricks treats ``?::`` as TRY_CAST),
+        we route through that callable so dialect semantics are preserved.
+        """
+        placeholder = self.expression(exp.Placeholder())
+
+        cast_type = self._parse_types()
+        if not cast_type:
+            self.raise_error("Expected type after '?::'")
+
+        op = self.COLUMN_OPERATORS.get(TokenType.QDCOLON)
+        if op is not None:
+            return op(self, placeholder, cast_type)
+
+        return self.build_cast(strict=self.STRICT_CAST, this=placeholder, to=cast_type)
 
     def _parse_star_op(self, *keywords: str) -> list[exp.Expr] | None:
         if not self._match_texts(keywords):
