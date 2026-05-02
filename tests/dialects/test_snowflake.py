@@ -1,6 +1,6 @@
 from unittest import mock
 
-from sqlglot import ParseError, UnsupportedError, exp, parse_one
+from sqlglot import ErrorLevel, ParseError, UnsupportedError, exp, parse_one
 from sqlglot.parser import logger as parser_logger
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
@@ -4719,35 +4719,48 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
         )
 
         # Design intent: a query that references a non-VALUE/INDEX pseudo-column
-        # (e.g. SEQ) currently still triggers the alias rewrite. The reference to
-        # f.SEQ becomes a downstream DuckDB bind error rather than a silent rename
-        # to something semantically wrong. This test pins that intent.
+        # (e.g. SEQ) still triggers the alias rewrite. The reference to f.SEQ
+        # becomes a downstream DuckDB bind error rather than a silent rename
+        # to something semantically wrong, but the transpiler now also emits a
+        # transpile-time `unsupported` warning so callers see the problem
+        # without having to wait for DuckDB's bind error.
         self.validate_all(
             "SELECT f.SEQ FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
             write={
                 "duckdb": "SELECT f.SEQ FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
             },
         )
+        # Re-run with RAISE to assert the warning is emitted at transpile time.
+        # validate_all uses ErrorLevel.IGNORE which suppresses messages.
+        with self.assertRaises(UnsupportedError) as ctx:
+            parse_one(
+                "SELECT f.SEQ FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+                read="snowflake",
+            ).sql("duckdb", unsupported_level=ErrorLevel.RAISE)
+        self.assertIn("FLATTEN pseudo-column 'SEQ'", str(ctx.exception))
 
-        # Partial-alias case: user-declared alias is a non-empty subset of the
-        # canonical 6-col set (e.g. just VALUE). The current implementation still
-        # emits the canonical 2-col alias `(value, index)` -- this adds a phantom
-        # `index` column the user didn't ask for. Documented in Known Limitations
-        # of the writeup; pinned here so future drift is detectable.
+        # Partial-alias case: user-declared alias is a strict subset of the
+        # canonical 6-col set (e.g. just VALUE). The rewrite emits ONLY the
+        # declared columns -- WITH ORDINALITY is dropped so we don't add a
+        # phantom `index` column the user didn't ask for. DuckDB accepts a
+        # single-name UNNEST alias cleanly.
         self.validate_all(
             "SELECT * FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(VALUE)",
             write={
-                "duckdb": "SELECT * FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+                "duckdb": "SELECT * FROM tbl, LATERAL UNNEST(tbl.arr) AS f(value)",
             },
         )
 
-    def test_lateral_flatten_to_duckdb_multi_arg_falls_through(self):
+    @mock.patch("sqlglot.generator.logger")
+    def test_lateral_flatten_to_duckdb_multi_arg_falls_through(self, logger):
         # FLATTEN with extra kwargs path/recursive/mode has no faithful DuckDB
         # rewrite. The predicate refuses to fire when these are present; the
         # existing fall-through handler emits SQL that fails loudly in DuckDB
         # (kwarg leaks through as `input =>`), which is the desired behaviour
         # over silently dropping kwargs and returning wrong rows. Note: `outer =>`
         # IS handled separately -- see test_lateral_flatten_outer_to_duckdb.
+        # The transpiler also emits a transpile-time `unsupported` warning so
+        # callers see the problem without having to wait for DuckDB's bind error.
         for src in (
             "SELECT id, f.value FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
             "SELECT f.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, recursive => TRUE) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
@@ -4759,7 +4772,18 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             self.assertIn("SEQ", out)
             self.assertNotIn("WITH ORDINALITY", out)
 
-    def test_lateral_flatten_outer_to_duckdb(self):
+            # Assert the transpile-time warning fires under RAISE mode.
+            with self.assertRaises(UnsupportedError) as ctx:
+                parse_one(src, read="snowflake").sql(
+                    "duckdb", unsupported_level=ErrorLevel.RAISE
+                )
+            self.assertIn(
+                "FLATTEN with unsupported kwargs (path/recursive/mode)",
+                str(ctx.exception),
+            )
+
+    @mock.patch("sqlglot.generator.logger")
+    def test_lateral_flatten_outer_to_duckdb(self, logger):
         # Snowflake `LATERAL FLATTEN(input => arr, outer => TRUE)` preserves the
         # outer-table row when the input array is NULL or empty (analogous to a
         # SQL LEFT OUTER JOIN). The DuckDB equivalent is
@@ -4787,8 +4811,8 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             },
         )
 
-        # No outer kwarg at all -- regression check for A2's existing canonical
-        # case. Default (no outer) keeps the original CROSS-JOIN-equivalent form.
+        # No outer kwarg at all -- regression check for the canonical LATERAL
+        # FLATTEN rewrite. Default (no outer) keeps the original CROSS-JOIN-equivalent form.
         self.validate_all(
             "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
             write={
@@ -4843,14 +4867,16 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             },
         )
 
-    def test_table_flatten_to_duckdb(self):
+    @mock.patch("sqlglot.generator.logger")
+    def test_table_flatten_to_duckdb(self, logger):
         # Standalone `TABLE(FLATTEN(input => arr))` (no LATERAL) parses to a
-        # `From -> TableFromRows(Explode(Kwarg('INPUT', expr)))` shape that A2's
-        # Lateral-gated rewrite cannot reach. Without this override the DuckDB
-        # generator emits `TABLE(UNNEST(input => arr))`, which DuckDB rejects with
-        # a parser error -- UNNEST does not accept a named `input =>` parameter.
-        # The override unwraps the kwarg and emits bare `UNNEST(arr) WITH ORDINALITY`,
-        # mirroring the alias rewrite from A2's LATERAL path.
+        # `From -> TableFromRows(Explode(Kwarg('INPUT', expr)))` shape that the
+        # Lateral-gated LATERAL FLATTEN rewrite cannot reach. Without this override
+        # the DuckDB generator emits `TABLE(UNNEST(input => arr))`, which DuckDB
+        # rejects with a parser error -- UNNEST does not accept a named `input =>`
+        # parameter. The override unwraps the kwarg and emits bare
+        # `UNNEST(arr) WITH ORDINALITY`, mirroring the alias rewrite from the
+        # LATERAL FLATTEN path.
 
         # Sub-case 1: bare TABLE(FLATTEN) with no alias -> auto `_flattened(value, index)`.
         self.validate_all(
@@ -4879,7 +4905,9 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
         # Sub-case 4 (negative): TABLE(FLATTEN) with extra kwargs (e.g. outer => TRUE)
         # has no faithful DuckDB rewrite. The predicate refuses to fire so the
         # generator falls through and emits the still-broken kwarg-bearing SQL --
-        # loud failure is preferred over silently-wrong rows.
+        # loud failure is preferred over silently-wrong rows. The transpiler also
+        # emits a transpile-time `unsupported` warning so callers see the problem
+        # without having to wait for DuckDB's bind error.
         out = parse_one(
             "SELECT VALUE FROM TABLE(FLATTEN(input => arr, outer => TRUE))",
             read="snowflake",
@@ -4887,6 +4915,15 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
         self.assertIn("input =>", out)
         self.assertIn("outer =>", out)
         self.assertNotIn("WITH ORDINALITY", out)
+        with self.assertRaises(UnsupportedError) as ctx:
+            parse_one(
+                "SELECT VALUE FROM TABLE(FLATTEN(input => arr, outer => TRUE))",
+                read="snowflake",
+            ).sql("duckdb", unsupported_level=ErrorLevel.RAISE)
+        self.assertIn(
+            "FLATTEN with unsupported kwargs (path/recursive/mode)",
+            str(ctx.exception),
+        )
 
         # Sub-case 5: partial canonical alias columns -- user wrote (VALUE, INDEX) using
         # the canonical-6 names but only 2 of them. The rewrite still collapses to the
@@ -4911,7 +4948,8 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
 
         # Sub-case 7 (negative): recursive => TRUE is in the same loud-failure family
         # as outer => TRUE. Pin separately so the full kwarg-blacklist surface
-        # (path/outer/recursive/mode) does not silently regress.
+        # (path/outer/recursive/mode) does not silently regress. Same transpile-time
+        # warning surfaces.
         out = parse_one(
             "SELECT VALUE FROM TABLE(FLATTEN(input => arr, recursive => TRUE))",
             read="snowflake",
@@ -4919,6 +4957,15 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
         self.assertIn("input =>", out)
         self.assertIn("recursive =>", out)
         self.assertNotIn("WITH ORDINALITY", out)
+        with self.assertRaises(UnsupportedError) as ctx:
+            parse_one(
+                "SELECT VALUE FROM TABLE(FLATTEN(input => arr, recursive => TRUE))",
+                read="snowflake",
+            ).sql("duckdb", unsupported_level=ErrorLevel.RAISE)
+        self.assertIn(
+            "FLATTEN with unsupported kwargs (path/recursive/mode)",
+            str(ctx.exception),
+        )
 
     def test_having_without_group_by_to_duckdb(self):
         # Snowflake permits `SELECT ... HAVING <expr>` with no GROUP BY; the predicate is

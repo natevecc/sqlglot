@@ -720,14 +720,17 @@ def _has_aggfunc_outside_subqueries(node: exp.Expression) -> bool:
     aggregate makes the HAVING-to-WHERE transform refuse rewrites that would
     actually be safe (and necessary, since DuckDB also rejects the original).
 
-    Implementation: clone the node, replace every ``exp.Subquery`` with a
-    ``Placeholder`` (severing recursion at the subquery boundary), then run
-    the standard recursive search on what remains.
+    Implementation: walk the AST manually, stopping recursion at every
+    ``exp.Subquery`` boundary. No clone, no AST mutation.
     """
-    clone = node.copy()
-    for sq in clone.find_all(exp.Subquery):
-        sq.replace(exp.Placeholder())
-    return any(clone.find_all(exp.AggFunc))
+    if isinstance(node, exp.Subquery):
+        return False
+    if isinstance(node, exp.AggFunc):
+        return True
+    for child in node.iter_expressions():
+        if _has_aggfunc_outside_subqueries(child):
+            return True
+    return False
 
 
 def _projection_blocks_having_move(projection: exp.Expression) -> bool:
@@ -1512,7 +1515,7 @@ def _xor_sql(self: DuckDBGenerator, expression: exp.Xor) -> str:
 # something wrong.
 #
 # The rewrite is gated on FLATTEN having ONLY the `input =>` kwarg, optionally plus
-# `outer => Boolean(true|false)` (A8 extension). When `outer => TRUE` is present, we
+# `outer => Boolean(true|false)`. When `outer => TRUE` is present, we
 # emit the LEFT JOIN LATERAL form so that NULL/empty input arrays preserve the parent
 # row (the FLATTEN OUTER analogue). When other kwargs are present (`path =>`,
 # `recursive =>`, `mode =>`, or any combination that includes them), we fall through
@@ -1565,11 +1568,11 @@ def _is_snowflake_flatten_explode(explode: exp.Expression) -> bool:
          so the fall-through emits SQL that errors loudly.
 
     This is the shared inner predicate consumed by both:
-      * :func:`_is_snowflake_flatten_lateral` (LATERAL FLATTEN -- A2/A8 surface), and
-      * :meth:`DuckDBGenerator.tablefromrows_sql` (standalone TABLE(FLATTEN) -- A4
+      * :func:`_is_snowflake_flatten_lateral` (LATERAL FLATTEN surface), and
+      * :meth:`DuckDBGenerator.tablefromrows_sql` (standalone TABLE(FLATTEN)
         surface). The standalone TABLE(FLATTEN) surface has no left-side row to
-        preserve, so the A4 branch additionally rejects the `outer =>` shape on
-        its own (callers responsible).
+        preserve, so the standalone TABLE(FLATTEN) branch additionally rejects
+        the `outer =>` shape on its own (callers responsible).
     """
     if not isinstance(explode, exp.Explode):
         return False
@@ -1583,6 +1586,35 @@ def _is_snowflake_flatten_explode(explode: exp.Expression) -> bool:
         return True
     # Allow exactly one extra: `outer => Boolean(true|false)`.
     return _snowflake_flatten_outer_kwarg(explode) is not None
+
+
+def _has_unsupported_flatten_kwargs(explode: exp.Expression) -> bool:
+    """True if ``explode`` is a ``FLATTEN(input => ..., <unsupported>)`` shape.
+
+    Used at the LATERAL FLATTEN and standalone TABLE(FLATTEN) refusal sites
+    to gate a transpile-time ``self.unsupported(...)`` warning. Returns True
+    only when the inner shape is FLATTEN (has the ``INPUT`` kwarg) AND has
+    extra kwargs that are NOT the lone ``outer => Boolean`` we know how to
+    handle. This avoids warning on unrelated Explode/Unnest constructs that
+    just happen to fall through the same path.
+    """
+    if not isinstance(explode, exp.Explode):
+        return False
+    if not isinstance(explode.this, exp.Kwarg):
+        return False
+    name = explode.this.this
+    if not isinstance(name, exp.Var) or name.name.upper() != "INPUT":
+        return False
+    extras = explode.args.get("expressions") or []
+    if not extras:
+        return False
+    # Has extras AND they are not the single supported `outer => Boolean`.
+    return _snowflake_flatten_outer_kwarg(explode) is None
+
+
+# FLATTEN pseudo-columns that have NO DuckDB equivalent. VALUE and INDEX both
+# map to ORDINALITY-style columns; the rest don't (SEQ, KEY, PATH, THIS).
+_SNOWFLAKE_FLATTEN_UNSUPPORTED_PSEUDO_COLS = frozenset({"SEQ", "KEY", "PATH", "THIS"})
 
 
 def _is_snowflake_flatten_lateral(expression: exp.Lateral) -> bool:
@@ -1657,12 +1689,60 @@ def _explode_to_unnest_sql(self: DuckDBGenerator, expression: exp.Lateral) -> st
     if _is_snowflake_flatten_lateral(expression):
         # Snowflake LATERAL FLATTEN(input => arr) AS f(SEQ,KEY,PATH,INDEX,VALUE,THIS)
         #   -> DuckDB LATERAL UNNEST(arr) WITH ORDINALITY AS f(value, index)
-        # The `outer => TRUE` (A8) variant is wrapped in `LEFT JOIN ... ON TRUE`
+        # The `outer => TRUE` variant is wrapped in `LEFT JOIN ... ON TRUE`
         # by `DuckDBGenerator.join_sql`; this transform only ever emits the inner
         # Lateral (no JOIN keywords) so the OUTER and non-OUTER paths share the
         # same construction here.
         kwarg = explode.this
         alias = expression.args["alias"]
+        declared_cols = alias.args.get("columns") or []
+        declared_names = {c.name.upper() for c in declared_cols if isinstance(c, exp.Identifier)}
+
+        # Pseudo-column projection warning: DuckDB has no equivalent for SEQ/KEY/
+        # PATH/THIS. Scan the enclosing Select for column references that point at
+        # this alias and use one of those names; warn but still proceed with the
+        # rewrite (the runtime DuckDB bind error is the backstop).
+        alias_table_name = alias.this.name if alias.this else None
+        if alias_table_name:
+            parent_select = expression.find_ancestor(exp.Select)
+            if parent_select is not None:
+                seen: set[str] = set()
+                for col in parent_select.find_all(exp.Column):
+                    table = col.table
+                    if not table or table != alias_table_name:
+                        continue
+                    col_name_upper = col.name.upper()
+                    if col_name_upper in _SNOWFLAKE_FLATTEN_UNSUPPORTED_PSEUDO_COLS:
+                        if col_name_upper in seen:
+                            continue
+                        seen.add(col_name_upper)
+                        self.unsupported(
+                            f"FLATTEN pseudo-column '{col.name}' has no DuckDB equivalent; "
+                            "reference will fail at bind time"
+                        )
+
+        # Partial-alias correctness: when the user declared only VALUE (and nothing
+        # else from the canonical set), drop WITH ORDINALITY so we don't emit a
+        # phantom `index` column. DuckDB accepts `UNNEST(arr) AS f(value)` cleanly.
+        # Other shapes (declared INDEX with/without VALUE, full canonical, alias
+        # containing pseudo-cols, or no declared columns at all) keep the canonical
+        # `(value, index) WITH ORDINALITY` emission. INDEX-only is awkward because
+        # ORDINALITY's column is positional (always 2nd), so we cannot selectively
+        # name only it -- canonical 2-col emission is the safest fallback.
+        only_value = declared_names == {"VALUE"}
+        if only_value:
+            alias_name = (
+                alias.this.copy() if alias.this else exp.to_identifier("_flattened")
+            )
+            new_lateral = exp.Lateral(
+                this=exp.Unnest(expressions=[kwarg.expression.copy()]),
+                alias=exp.TableAlias(
+                    this=alias_name,
+                    columns=[exp.to_identifier("value")],
+                ),
+            )
+            return self.sql(new_lateral)
+
         # Match the Snowflake parser's auto-inject default (`_flattened`) when the
         # source had no table-name component on the alias. Defensive: predicate
         # only requires non-empty columns, so this normally won't fire.
@@ -1676,6 +1756,17 @@ def _explode_to_unnest_sql(self: DuckDBGenerator, expression: exp.Lateral) -> st
             ),
         )
         return self.sql(new_lateral)
+
+    # FLATTEN with unsupported kwargs (path/recursive/mode, or a mix that includes
+    # `outer =>` plus something else) has no faithful DuckDB rewrite. The fall-through
+    # below emits SQL that fails loudly in DuckDB (the `input =>` kwarg leaks through
+    # as a named UNNEST parameter that DuckDB rejects), but no transpile-time signal
+    # was previously surfaced -- raise it here.
+    if _has_unsupported_flatten_kwargs(explode):
+        self.unsupported(
+            "FLATTEN with unsupported kwargs (path/recursive/mode) has no "
+            "DuckDB equivalent; output will fail at bind time"
+        )
 
     # For other cases, use the standard conversion
     return explode_to_unnest_sql(self, expression)
@@ -3233,7 +3324,7 @@ class DuckDBGenerator(generator.Generator):
         return super().tablesample_sql(expression, tablesample_keyword=tablesample_keyword)
 
     def join_sql(self, expression: exp.Join) -> str:
-        # A8: Snowflake `LATERAL FLATTEN(input => arr, outer => TRUE)` must emit
+        # Snowflake `LATERAL FLATTEN(input => arr, outer => TRUE)` must emit
         # `LEFT JOIN LATERAL UNNEST(arr) WITH ORDINALITY AS f(value, index) ON TRUE`
         # so NULL/empty input arrays preserve the parent row. The Lateral's
         # transform (`_explode_to_unnest_sql`) cannot mutate this Join's `side`
@@ -4039,16 +4130,18 @@ class DuckDBGenerator(generator.Generator):
             return self.sql(table)
 
         # Standalone `TABLE(FLATTEN(input => arr))` (no LATERAL): the sister case
-        # to A2's LATERAL FLATTEN rewrite. Without this branch, the kwarg leaks
-        # through as `TABLE(UNNEST(input => arr))`, which DuckDB rejects -- UNNEST
-        # has no named `input =>` parameter. Rewrite to bare
-        # `UNNEST(arr) WITH ORDINALITY AS <alias>(value, index)`, mirroring A2's
-        # alias normalization. Predicate is shared with the LATERAL path so any
-        # future extension (e.g. supporting extra FLATTEN kwargs) lands in one place.
+        # to the LATERAL FLATTEN rewrite handled in `_explode_to_unnest_sql`. Without
+        # this branch, the kwarg leaks through as `TABLE(UNNEST(input => arr))`,
+        # which DuckDB rejects -- UNNEST has no named `input =>` parameter. Rewrite
+        # to bare `UNNEST(arr) WITH ORDINALITY AS <alias>(value, index)`, mirroring
+        # the LATERAL path's alias normalization. Predicate is shared with the
+        # LATERAL path so any future extension (e.g. supporting extra FLATTEN
+        # kwargs) lands in one place.
         #
-        # A8 caveat: `_is_snowflake_flatten_explode` now ALSO accepts an `outer =>
-        # Boolean` kwarg (handled by the LATERAL caller). Standalone TABLE(FLATTEN)
-        # has no left-side row to preserve, so we explicitly refuse the outer-bearing
+        # Note: `_is_snowflake_flatten_explode` ALSO accepts an `outer => Boolean`
+        # kwarg (handled by the LATERAL caller, which can wrap the result in a
+        # LEFT JOIN to preserve parent rows). Standalone TABLE(FLATTEN) has no
+        # left-side row to preserve, so we explicitly refuse the outer-bearing
         # shape here -- it falls through to the broken-but-loud generator output.
         explode = expression.this
         if (
@@ -4057,15 +4150,19 @@ class DuckDBGenerator(generator.Generator):
         ):
             kwarg = explode.this
             existing_alias = expression.args.get("alias")
-            # Mirror A2's alias-rewrite block: only collapse to (value, index) when
-            # the user-declared alias columns are a subset of the canonical 6 (or
-            # absent). Otherwise fall through and let the loud failure surface.
+            # Mirror the LATERAL path's alias-rewrite block: only collapse to
+            # (value, index) when the user-declared alias columns are a subset of
+            # the canonical 6 (or absent). Otherwise fall through and let the loud
+            # failure surface.
             collapse_alias = True
+            declared_names: set[str] = set()
             alias_name: exp.Identifier
             if isinstance(existing_alias, exp.TableAlias):
                 cols = existing_alias.args.get("columns") or []
-                col_names = {c.name.upper() for c in cols if isinstance(c, exp.Identifier)}
-                if cols and not col_names.issubset(_SNOWFLAKE_FLATTEN_ALIAS_COLS):
+                declared_names = {
+                    c.name.upper() for c in cols if isinstance(c, exp.Identifier)
+                }
+                if cols and not declared_names.issubset(_SNOWFLAKE_FLATTEN_ALIAS_COLS):
                     collapse_alias = False
                 alias_name = (
                     existing_alias.this.copy()
@@ -4076,6 +4173,21 @@ class DuckDBGenerator(generator.Generator):
                 alias_name = exp.to_identifier("_flattened")
 
             if collapse_alias:
+                # Partial-alias correctness: when the user declared only VALUE
+                # (and nothing else from the canonical set), drop the ordinality
+                # column so we don't emit a phantom `index`. Other shapes keep
+                # the canonical (value, index) emission. See the matching block
+                # in `_explode_to_unnest_sql` for rationale.
+                if declared_names == {"VALUE"}:
+                    unnest = exp.Unnest(
+                        expressions=[kwarg.expression.copy()],
+                        alias=exp.TableAlias(
+                            this=alias_name,
+                            columns=[exp.to_identifier("value")],
+                        ),
+                    )
+                    return self.sql(unnest)
+
                 unnest = exp.Unnest(
                     expressions=[kwarg.expression.copy()],
                     offset=True,
@@ -4085,6 +4197,19 @@ class DuckDBGenerator(generator.Generator):
                     ),
                 )
                 return self.sql(unnest)
+
+        # Standalone TABLE(FLATTEN(...)) with unsupported kwargs (path/recursive/
+        # mode, or `outer =>` which has no analogue without a left-side row to
+        # preserve). Mirror the LATERAL refusal warning so callers see a
+        # transpile-time signal instead of only a runtime DuckDB bind error.
+        if _has_unsupported_flatten_kwargs(explode) or (
+            _is_snowflake_flatten_explode(explode)
+            and _snowflake_flatten_outer_kwarg(explode) is not None
+        ):
+            self.unsupported(
+                "FLATTEN with unsupported kwargs (path/recursive/mode) has no "
+                "DuckDB equivalent; output will fail at bind time"
+            )
 
         return super().tablefromrows_sql(expression)
 
