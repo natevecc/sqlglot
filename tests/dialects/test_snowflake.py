@@ -4661,6 +4661,387 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             pretty=True,
         )
 
+    def test_lateral_flatten_to_duckdb(self):
+        # Snowflake LATERAL FLATTEN(input => arr) AS f(SEQ,KEY,PATH,INDEX,VALUE,THIS)
+        # is the canonical 6-pseudo-column shape. DuckDB has no FLATTEN; the closest
+        # equivalent is UNNEST(arr) WITH ORDINALITY AS f(value, index). The transpile
+        # must (a) unwrap the `input =>` kwarg, (b) emit WITH ORDINALITY, and
+        # (c) rewrite the 6-column alias to (value, index). DuckDB accepts both
+        # `, LATERAL UNNEST(...)` and `CROSS JOIN UNNEST(...)`; we preserve the
+        # `LATERAL` form since the generator already emits it for non-FLATTEN laterals.
+        self.validate_all(
+            "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+        # The Snowflake parser auto-injects the 6-column alias when the user omits it.
+        # Same rewrite applies.
+        self.validate_all(
+            "SELECT * FROM t, LATERAL FLATTEN(input => x)",
+            write={
+                "duckdb": "SELECT * FROM t, LATERAL UNNEST(x) WITH ORDINALITY AS _flattened(value, index)",
+            },
+        )
+
+        # Negative case: an unrelated LATERAL (no FLATTEN) must be untouched.
+        self.validate_all(
+            "SELECT v.x FROM t, LATERAL (SELECT 1 AS x) AS v",
+            write={
+                "duckdb": "SELECT v.x FROM t, LATERAL (SELECT 1 AS x) AS v",
+            },
+        )
+
+        # Lowercase unquoted alias columns: rewrite still fires (case-folded match).
+        self.validate_all(
+            "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(seq, key, path, index, value, this)",
+            write={
+                "duckdb": "SELECT t.value FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+        # Quoted uppercase alias columns: rewrite still fires.
+        self.validate_all(
+            'SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f("SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS")',
+            write={
+                "duckdb": "SELECT t.value FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+        # Two chained LATERAL FLATTENs (common Snowflake idiom for nested arrays):
+        # both must be rewritten independently.
+        self.validate_all(
+            "SELECT f1.value, f2.value FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f1(SEQ, KEY, PATH, INDEX, VALUE, THIS), LATERAL FLATTEN(input => f1.value) AS f2(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT f1.value, f2.value FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f1(value, index), LATERAL UNNEST(f1.value) WITH ORDINALITY AS f2(value, index)",
+            },
+        )
+
+        # Design intent: a query that references a non-VALUE/INDEX pseudo-column
+        # (e.g. SEQ) currently still triggers the alias rewrite. The reference to
+        # f.SEQ becomes a downstream DuckDB bind error rather than a silent rename
+        # to something semantically wrong. This test pins that intent.
+        self.validate_all(
+            "SELECT f.SEQ FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT f.SEQ FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+        # Partial-alias case: user-declared alias is a non-empty subset of the
+        # canonical 6-col set (e.g. just VALUE). The current implementation still
+        # emits the canonical 2-col alias `(value, index)` -- this adds a phantom
+        # `index` column the user didn't ask for. Documented in Known Limitations
+        # of the writeup; pinned here so future drift is detectable.
+        self.validate_all(
+            "SELECT * FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(VALUE)",
+            write={
+                "duckdb": "SELECT * FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+    def test_lateral_flatten_to_duckdb_multi_arg_falls_through(self):
+        # FLATTEN with extra kwargs path/recursive/mode has no faithful DuckDB
+        # rewrite. The predicate refuses to fire when these are present; the
+        # existing fall-through handler emits SQL that fails loudly in DuckDB
+        # (kwarg leaks through as `input =>`), which is the desired behaviour
+        # over silently dropping kwargs and returning wrong rows. Note: `outer =>`
+        # IS handled separately -- see test_lateral_flatten_outer_to_duckdb.
+        for src in (
+            "SELECT id, f.value FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            "SELECT f.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, recursive => TRUE) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            "SELECT f.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, mode => 'OBJECT') AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+        ):
+            out = parse_one(src, read="snowflake").sql("duckdb")
+            # Predicate refused: 6-col alias survives, kwargs are NOT silently dropped.
+            self.assertIn("input =>", out)
+            self.assertIn("SEQ", out)
+            self.assertNotIn("WITH ORDINALITY", out)
+
+    def test_lateral_flatten_outer_to_duckdb(self):
+        # Snowflake `LATERAL FLATTEN(input => arr, outer => TRUE)` preserves the
+        # outer-table row when the input array is NULL or empty (analogous to a
+        # SQL LEFT OUTER JOIN). The DuckDB equivalent is
+        # `LEFT JOIN LATERAL UNNEST(arr) WITH ORDINALITY AS f(value, index) ON TRUE`
+        # (the inner LATERAL still produces zero rows for NULL/empty arrays, but
+        # the LEFT JOIN preserves the parent row with NULLs in the unnested cols).
+        # Real-world driver: epic/.../patient_encounters_dx_v2.sql uses this shape.
+        # Refs: https://docs.snowflake.com/en/sql-reference/functions/flatten#optional-arguments
+
+        # outer => TRUE with the canonical 6-col alias.
+        self.validate_all(
+            "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, outer => TRUE) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value FROM tbl LEFT JOIN LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index) ON TRUE",
+            },
+        )
+
+        # outer => FALSE behaves identically to the no-kwarg case -- emits the
+        # comma-join (CROSS JOIN equivalent) form. Pinned to ensure we do NOT
+        # silently rewrite to LEFT JOIN when outer is explicitly false.
+        self.validate_all(
+            "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, outer => FALSE) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+        # No outer kwarg at all -- regression check for A2's existing canonical
+        # case. Default (no outer) keeps the original CROSS-JOIN-equivalent form.
+        self.validate_all(
+            "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value FROM tbl, LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index)",
+            },
+        )
+
+        # outer => TRUE with the auto-injected alias (user omitted alias entirely).
+        self.validate_all(
+            "SELECT * FROM t, LATERAL FLATTEN(input => x, outer => TRUE)",
+            write={
+                "duckdb": "SELECT * FROM t LEFT JOIN LATERAL UNNEST(x) WITH ORDINALITY AS _flattened(value, index) ON TRUE",
+            },
+        )
+
+        # Negative pin: combining `outer =>` with another unsupported kwarg
+        # (e.g. `path =>`) must STILL fall through. The predicate only allows
+        # the single `outer` extra; any other extras (or a mix) keeps the
+        # loud-failure stance. Real-world: no examples mix outer with path,
+        # but keep the surface narrow. Note: the fall-through path silently
+        # drops the extra kwargs (path/outer/recursive/mode) from `expressions`
+        # because vanilla generation only emits `this`; the surviving `input =>`
+        # kwarg is what produces the loud DuckDB error -- same behaviour as the
+        # other multi-arg cases pinned by test_lateral_flatten_to_duckdb_multi_arg_falls_through.
+        out = parse_one(
+            "SELECT f.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, outer => TRUE, path => 'a') AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            read="snowflake",
+        ).sql("duckdb")
+        self.assertIn("input =>", out)
+        self.assertIn("SEQ", out)
+        self.assertNotIn("WITH ORDINALITY", out)
+
+        # Lowercase Boolean literal (`outer => true`) -- pin parser case-folding.
+        # sqlglot parses `true`/`True`/`TRUE` to the same Boolean(this=True), so
+        # all three flow through the same LEFT JOIN branch. Cheap defense against
+        # a future parser refactor that might preserve case.
+        self.validate_all(
+            "SELECT t.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, outer => true) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value FROM tbl LEFT JOIN LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index) ON TRUE",
+            },
+        )
+
+        # Multiple LATERAL FLATTENs in one SELECT, only one with `outer => TRUE`.
+        # The `join_sql` override must dispatch per-Join: the outer-bearing
+        # FLATTEN gets LEFT JOIN ... ON TRUE; the other keeps the comma-join
+        # form. Pins per-Join branching against future short-circuit refactors.
+        self.validate_all(
+            "SELECT t.value, g.value FROM tbl, LATERAL FLATTEN(input => tbl.arr, outer => TRUE) AS f(SEQ, KEY, PATH, INDEX, VALUE, THIS), LATERAL FLATTEN(input => tbl.brr) AS g(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value, g.value FROM tbl LEFT JOIN LATERAL UNNEST(tbl.arr) WITH ORDINALITY AS f(value, index) ON TRUE, LATERAL UNNEST(tbl.brr) WITH ORDINALITY AS g(value, index)",
+            },
+        )
+
+    def test_table_flatten_to_duckdb(self):
+        # Standalone `TABLE(FLATTEN(input => arr))` (no LATERAL) parses to a
+        # `From -> TableFromRows(Explode(Kwarg('INPUT', expr)))` shape that A2's
+        # Lateral-gated rewrite cannot reach. Without this override the DuckDB
+        # generator emits `TABLE(UNNEST(input => arr))`, which DuckDB rejects with
+        # a parser error -- UNNEST does not accept a named `input =>` parameter.
+        # The override unwraps the kwarg and emits bare `UNNEST(arr) WITH ORDINALITY`,
+        # mirroring the alias rewrite from A2's LATERAL path.
+
+        # Sub-case 1: bare TABLE(FLATTEN) with no alias -> auto `_flattened(value, index)`.
+        self.validate_all(
+            "SELECT VALUE FROM TABLE(FLATTEN(input => arr))",
+            write={
+                "duckdb": "SELECT VALUE FROM UNNEST(arr) WITH ORDINALITY AS _flattened(value, index)",
+            },
+        )
+
+        # Sub-case 2: explicit table-name + 6-column canonical alias.
+        self.validate_all(
+            "SELECT t.value FROM TABLE(FLATTEN(input => my_arr)) AS t(SEQ, KEY, PATH, INDEX, VALUE, THIS)",
+            write={
+                "duckdb": "SELECT t.value FROM UNNEST(my_arr) WITH ORDINALITY AS t(value, index)",
+            },
+        )
+
+        # Sub-case 3 (negative): TABLE(GENERATOR(...)) must keep RANGE rewrite untouched.
+        self.validate_all(
+            "SELECT * FROM TABLE(GENERATOR(ROWCOUNT => 5))",
+            write={
+                "duckdb": "SELECT * FROM RANGE(5)",
+            },
+        )
+
+        # Sub-case 4 (negative): TABLE(FLATTEN) with extra kwargs (e.g. outer => TRUE)
+        # has no faithful DuckDB rewrite. The predicate refuses to fire so the
+        # generator falls through and emits the still-broken kwarg-bearing SQL --
+        # loud failure is preferred over silently-wrong rows.
+        out = parse_one(
+            "SELECT VALUE FROM TABLE(FLATTEN(input => arr, outer => TRUE))",
+            read="snowflake",
+        ).sql("duckdb")
+        self.assertIn("input =>", out)
+        self.assertIn("outer =>", out)
+        self.assertNotIn("WITH ORDINALITY", out)
+
+        # Sub-case 5: partial canonical alias columns -- user wrote (VALUE, INDEX) using
+        # the canonical-6 names but only 2 of them. The rewrite still collapses to the
+        # 2-col DuckDB shape (value, index) lowercased, since the names are a subset.
+        # This pins the case-fold rename behaviour and the alias-collapse intent.
+        self.validate_all(
+            "SELECT t.value FROM TABLE(FLATTEN(input => arr)) AS t(VALUE, INDEX)",
+            write={
+                "duckdb": "SELECT t.value FROM UNNEST(arr) WITH ORDINALITY AS t(value, index)",
+            },
+        )
+
+        # Sub-case 6: two standalone TABLE(FLATTEN) in the same FROM. Predicate must
+        # fire independently for each -- regression guard against any shared-state bug
+        # in the predicate or the generator branch.
+        self.validate_all(
+            "SELECT a.value, b.value FROM TABLE(FLATTEN(input => arr1)) a, TABLE(FLATTEN(input => arr2)) b",
+            write={
+                "duckdb": "SELECT a.value, b.value FROM UNNEST(arr1) WITH ORDINALITY AS a(value, index), UNNEST(arr2) WITH ORDINALITY AS b(value, index)",
+            },
+        )
+
+        # Sub-case 7 (negative): recursive => TRUE is in the same loud-failure family
+        # as outer => TRUE. Pin separately so the full kwarg-blacklist surface
+        # (path/outer/recursive/mode) does not silently regress.
+        out = parse_one(
+            "SELECT VALUE FROM TABLE(FLATTEN(input => arr, recursive => TRUE))",
+            read="snowflake",
+        ).sql("duckdb")
+        self.assertIn("input =>", out)
+        self.assertIn("recursive =>", out)
+        self.assertNotIn("WITH ORDINALITY", out)
+
+    def test_having_without_group_by_to_duckdb(self):
+        # Snowflake permits `SELECT ... HAVING <expr>` with no GROUP BY; the predicate is
+        # treated as an implicit row filter when the predicate is non-aggregate. DuckDB
+        # rejects this shape with "column must appear in the GROUP BY clause" because it
+        # classifies any HAVING-bearing query as grouped. The transform moves the HAVING
+        # content into WHERE (AND-combined with any existing WHERE) and clears HAVING,
+        # but only when:
+        #   (a) GROUP BY is absent, AND
+        #   (b) the HAVING expression contains no aggregate functions.
+        # Bare aggregate HAVINGs (e.g. `HAVING COUNT(*) > 5`) are accepted by DuckDB
+        # natively as implicit single-group queries, so they are left untouched -- moving
+        # them to WHERE would trigger DuckDB's "WHERE cannot contain aggregates" error.
+        #
+        # Refs: https://docs.snowflake.com/en/sql-reference/constructs/having
+        #       https://duckdb.org/docs/sql/query_syntax/having
+
+        # Non-aggregate HAVING without GROUP BY -> WHERE rewrite (the bug we fix).
+        self.validate_all(
+            "SELECT a FROM t HAVING a > 5",
+            write={
+                "duckdb": "SELECT a FROM t WHERE a > 5",
+            },
+        )
+
+        # Existing WHERE is preserved and AND-combined with the moved HAVING expression.
+        self.validate_all(
+            "SELECT a FROM t WHERE b = 1 HAVING a > 5",
+            write={
+                "duckdb": "SELECT a FROM t WHERE b = 1 AND a > 5",
+            },
+        )
+
+        # Negative: HAVING with an explicit GROUP BY must be left alone.
+        self.validate_all(
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 5",
+            write={
+                "duckdb": "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 5",
+            },
+        )
+
+        # Negative: aggregate HAVING without GROUP BY is left alone -- DuckDB accepts
+        # this natively (implicit single-group) and would reject the predicate in WHERE.
+        self.validate_all(
+            "SELECT COUNT(*) FROM t HAVING COUNT(*) > 5",
+            write={
+                "duckdb": "SELECT COUNT(*) FROM t HAVING COUNT(*) > 5",
+            },
+        )
+
+        # Negative: aggregate appears in a projection with an alias and HAVING
+        # references the alias. DuckDB accepts the original via implicit single-group;
+        # rewriting to WHERE would reject "WHERE cannot contain aggregates" once
+        # the alias resolves. The projection-aggregate guard handles this.
+        self.validate_all(
+            "SELECT SUM(a) AS c FROM t HAVING c > 3",
+            write={
+                "duckdb": "SELECT SUM(a) AS c FROM t HAVING c > 3",
+            },
+        )
+
+        # Negative: aggregate wrapped inside CASE/COALESCE in a projection. The
+        # recursive find_all(AggFunc) on each projection catches the inner SUM.
+        self.validate_all(
+            "SELECT COALESCE(MAX(a), 0) AS m FROM t HAVING m > 5",
+            write={
+                "duckdb": "SELECT COALESCE(MAX(a), 0) AS m FROM t HAVING m > 5",
+            },
+        )
+
+        # Negative: window function in projection. Snowflake permits HAVING after
+        # windowing; DuckDB rejects window functions in WHERE. Refusing the move
+        # leaves the original error in place rather than swapping it for a
+        # different one. Note exp.Window is NOT a subclass of exp.AggFunc so this
+        # case requires a separate guard. See DuckDB binder review (loop 1).
+        self.validate_all(
+            "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t HAVING rn > 2",
+            write={
+                "duckdb": "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t HAVING rn > 2",
+            },
+        )
+
+        # Three-valued logic: HAVING and WHERE share identical predicate semantics
+        # for IS NULL / IS NOT NULL / =/<>/AND/OR. Pin that the rewrite preserves
+        # NULL handling.
+        self.validate_all(
+            "SELECT a FROM t HAVING a IS NOT NULL",
+            write={
+                "duckdb": "SELECT a FROM t WHERE NOT a IS NULL",
+            },
+        )
+
+        # HAVING with a subquery (no inner aggregate) is fully eligible for the
+        # rewrite -- no aggregate at the top level of HAVING, and the subquery
+        # body is independently bound.
+        self.validate_all(
+            "SELECT a FROM t HAVING a IN (SELECT a FROM t WHERE a > 2)",
+            write={
+                "duckdb": "SELECT a FROM t WHERE a IN (SELECT a FROM t WHERE a > 2)",
+            },
+        )
+
+        # HAVING with a *correlated* subquery whose inner Select contains an
+        # aggregate. Aggregates inside subqueries belong to the inner scope,
+        # not the outer one, so the rewrite is safe and necessary (DuckDB
+        # rejects the original because it sees HAVING-without-GROUP-BY).
+        # See _has_aggfunc_outside_subqueries.
+        self.validate_all(
+            "SELECT t1.a FROM t AS t1 HAVING t1.a > (SELECT MAX(a) FROM t AS t2 WHERE t2.a < t1.a)",
+            write={
+                "duckdb": "SELECT t1.a FROM t AS t1 WHERE t1.a > (SELECT MAX(a) FROM t AS t2 WHERE t2.a < t1.a)",
+            },
+        )
+
+        # Sibling clauses (ORDER BY, LIMIT) are preserved untouched by the
+        # HAVING -> WHERE rewrite. Pin to guard against accidental drops.
+        self.validate_all(
+            "SELECT a FROM t HAVING a > 5 ORDER BY a LIMIT 2",
+            write={
+                "duckdb": "SELECT a FROM t WHERE a > 5 ORDER BY a LIMIT 2",
+            },
+        )
+
     def test_minus(self):
         self.validate_all(
             "SELECT 1 EXCEPT SELECT 1",
@@ -5011,7 +5392,7 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             "SELECT REGEXP_INSTR(subject, pattern)",
             write={
                 "snowflake": "SELECT REGEXP_INSTR(subject, pattern)",
-                "duckdb": "SELECT CASE WHEN subject IS NULL OR pattern IS NULL THEN NULL WHEN pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(subject, pattern)) < 1 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(subject, pattern)[1:1], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(subject, pattern)[1:1 - 1], x -> LENGTH(x))), 0) + 0 END",
+                "duckdb": "SELECT CAST(CASE WHEN subject IS NULL OR pattern IS NULL THEN NULL WHEN pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(subject, pattern)) < 1 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(subject, pattern)[1:1], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(subject, pattern)[1:1 - 1], x -> LENGTH(x))), 0) + 0 END AS BIGINT)",
             },
         )
 
@@ -5020,7 +5401,7 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             "SELECT REGEXP_INSTR(subject, pattern, 5)",
             write={
                 "snowflake": "SELECT REGEXP_INSTR(subject, pattern, 5)",
-                "duckdb": "SELECT CASE WHEN subject IS NULL OR pattern IS NULL OR 5 IS NULL THEN NULL WHEN pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(SUBSTRING(subject, 5), pattern)) < 1 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(SUBSTRING(subject, 5), pattern)[1:1], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(SUBSTRING(subject, 5), pattern)[1:1 - 1], x -> LENGTH(x))), 0) + 5 - 1 END",
+                "duckdb": "SELECT CAST(CASE WHEN subject IS NULL OR pattern IS NULL OR 5 IS NULL THEN NULL WHEN pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(SUBSTRING(subject, 5), pattern)) < 1 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(SUBSTRING(subject, 5), pattern)[1:1], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(SUBSTRING(subject, 5), pattern)[1:1 - 1], x -> LENGTH(x))), 0) + 5 - 1 END AS BIGINT)",
             },
         )
 
@@ -5029,7 +5410,7 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             "SELECT REGEXP_INSTR(subject, pattern, 1, 2)",
             write={
                 "snowflake": "SELECT REGEXP_INSTR(subject, pattern, 1, 2)",
-                "duckdb": "SELECT CASE WHEN subject IS NULL OR pattern IS NULL OR 1 IS NULL OR 2 IS NULL THEN NULL WHEN pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(subject, pattern)) < 2 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(subject, pattern)[1:2], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(subject, pattern)[1:2 - 1], x -> LENGTH(x))), 0) + 0 END",
+                "duckdb": "SELECT CAST(CASE WHEN subject IS NULL OR pattern IS NULL OR 1 IS NULL OR 2 IS NULL THEN NULL WHEN pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(subject, pattern)) < 2 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(subject, pattern)[1:2], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(subject, pattern)[1:2 - 1], x -> LENGTH(x))), 0) + 0 END AS BIGINT)",
             },
         )
 
@@ -5038,7 +5419,7 @@ FROM persons AS p, LATERAL FLATTEN(input => p.c, path => 'contact') AS _flattene
             "SELECT REGEXP_INSTR(subject, pattern, 1, 1, 0, 'im')",
             write={
                 "snowflake": "SELECT REGEXP_INSTR(subject, pattern, 1, 1, 0, 'im')",
-                "duckdb": "SELECT CASE WHEN subject IS NULL OR pattern IS NULL OR 1 IS NULL OR 1 IS NULL OR 0 IS NULL OR 'im' IS NULL THEN NULL WHEN '(?im)' || pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(subject, '(?im)' || pattern)) < 1 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(subject, '(?im)' || pattern)[1:1], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(subject, '(?im)' || pattern)[1:1 - 1], x -> LENGTH(x))), 0) + 0 END",
+                "duckdb": "SELECT CAST(CASE WHEN subject IS NULL OR pattern IS NULL OR 1 IS NULL OR 1 IS NULL OR 0 IS NULL OR 'im' IS NULL THEN NULL WHEN '(?im)' || pattern = '' THEN 0 WHEN LENGTH(REGEXP_EXTRACT_ALL(subject, '(?im)' || pattern)) < 1 THEN 0 ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(subject, '(?im)' || pattern)[1:1], x -> LENGTH(x))), 0) + COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(subject, '(?im)' || pattern)[1:1 - 1], x -> LENGTH(x))), 0) + 0 END AS BIGINT)",
             },
         )
 
@@ -6093,6 +6474,48 @@ FROM SEMANTIC_VIEW(
         self.validate_identity("MD5_BINARY(col)")
         self.validate_identity("MD5_NUMBER_LOWER64(col)")
         self.validate_identity("MD5_NUMBER_UPPER64(col)")
+
+    def test_md5_numeric_arg_to_duckdb(self):
+        # Mirrors test_sha1's annotate_types pattern: cast only when type is
+        # known and incompatible with DuckDB's MD5 signature (TEXT/BLOB).
+
+        # Untyped: no annotation, type unknown -> do not cast (no noise).
+        self.validate_all(
+            "SELECT MD5(col) FROM t",
+            read={"snowflake": "SELECT MD5(col) FROM t"},
+            write={"duckdb": "SELECT MD5(col) FROM t"},
+        )
+        # String literal: TEXT_TYPES -> not cast.
+        self.validate_all(
+            "SELECT MD5('hello')",
+            read={"snowflake": "SELECT MD5('hello')"},
+            write={"duckdb": "SELECT MD5('hello')"},
+        )
+        # Already CAST to VARCHAR: not double-wrapped.
+        self.validate_all(
+            "SELECT MD5(CAST(col AS VARCHAR)) FROM t",
+            read={"snowflake": "SELECT MD5(CAST(col AS VARCHAR)) FROM t"},
+            write={"duckdb": "SELECT MD5(CAST(col AS TEXT)) FROM t"},
+        )
+        # Annotated numeric: type is INT -> cast to VARCHAR.
+        expr = self.validate_identity("MD5(123)")
+        annotated = annotate_types(expr, dialect="snowflake")
+        self.assertEqual(annotated.sql("snowflake"), "MD5(123)")
+        self.assertEqual(annotated.sql("duckdb"), "MD5(CAST(123 AS TEXT))")
+        # Annotated boolean: type is BOOLEAN -> cast.
+        expr = self.validate_identity("MD5(TRUE)")
+        annotated = annotate_types(expr, dialect="snowflake")
+        self.assertEqual(annotated.sql("duckdb"), "MD5(CAST(TRUE AS TEXT))")
+        # Annotated date: cast to text.
+        expr = self.validate_identity("MD5(DATE '2024-01-15')", "MD5(CAST('2024-01-15' AS DATE))")
+        annotated = annotate_types(expr, dialect="snowflake")
+        self.assertEqual(annotated.sql("duckdb"), "MD5(CAST(CAST('2024-01-15' AS DATE) AS TEXT))")
+        # NULL: untyped -> do not cast.
+        self.validate_all(
+            "SELECT MD5(NULL)",
+            read={"snowflake": "SELECT MD5(NULL)"},
+            write={"duckdb": "SELECT MD5(NULL)"},
+        )
 
     def test_sha1(self):
         self.validate_all(

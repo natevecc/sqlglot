@@ -4812,6 +4812,58 @@ FROM subquery2""",
             },
         )
 
+        # DuckDB emulation must wrap the CASE in CAST(... AS BIGINT) so the
+        # result is BIGINT (not HUGEINT) and composes with SUBSTRING and
+        # other consumers that bind on BIGINT.
+        self.validate_all(
+            "SELECT REGEXP_INSTR(s, p) FROM t",
+            read={"snowflake": "SELECT REGEXP_INSTR(s, p) FROM t"},
+            write={
+                "duckdb": (
+                    "SELECT CAST(CASE WHEN s IS NULL OR p IS NULL THEN NULL "
+                    "WHEN p = '' THEN 0 "
+                    "WHEN LENGTH(REGEXP_EXTRACT_ALL(s, p)) < 1 THEN 0 "
+                    "ELSE 1 + COALESCE(LIST_SUM(LIST_TRANSFORM(STRING_SPLIT_REGEX(s, p)[1:1], x -> LENGTH(x))), 0) "
+                    "+ COALESCE(LIST_SUM(LIST_TRANSFORM(REGEXP_EXTRACT_ALL(s, p)[1:1 - 1], x -> LENGTH(x))), 0) "
+                    "+ 0 END AS BIGINT) FROM t"
+                )
+            },
+        )
+
+        # End-to-end against live DuckDB: SUBSTRING(VARCHAR, REGEXP_INSTR(...), INT)
+        # must bind without 'No function matches substring(VARCHAR, HUGEINT, INTEGER)'.
+        try:
+            import duckdb
+
+            con = duckdb.connect()
+            con.execute("CREATE TABLE t AS SELECT 'abc123def' AS s")
+            transpiled = parse_one(
+                "SELECT SUBSTRING(s, REGEXP_INSTR(s, '[0-9]+'), 3) FROM t",
+                read="snowflake",
+            ).sql("duckdb")
+            result = con.execute(transpiled).fetchall()
+            self.assertEqual(result, [("123",)])
+
+            # NULL preservation through the CAST: REGEXP_INSTR(NULL, 'x') -> NULL
+            null_sql = parse_one(
+                "SELECT REGEXP_INSTR(NULL, 'x')", read="snowflake"
+            ).sql("duckdb")
+            self.assertEqual(con.execute(null_sql).fetchall(), [(None,)])
+
+            # Empty-pattern branch: WHEN p = '' THEN 0
+            empty_sql = parse_one(
+                "SELECT REGEXP_INSTR('abc', '')", read="snowflake"
+            ).sql("duckdb")
+            self.assertEqual(con.execute(empty_sql).fetchall(), [(0,)])
+
+            # No-match branch: WHEN LENGTH(REGEXP_EXTRACT_ALL(...)) < occurrence THEN 0
+            no_match_sql = parse_one(
+                "SELECT REGEXP_INSTR('abc', '[0-9]+')", read="snowflake"
+            ).sql("duckdb")
+            self.assertEqual(con.execute(no_match_sql).fetchall(), [(0,)])
+        except ImportError:
+            pass
+
     def test_format(self):
         self.validate_all(
             "FORMAT('str fmt1 fmt2', 1, 'a')",

@@ -710,6 +710,112 @@ def _seq_to_range_in_generator(expression: exp.Expr) -> exp.Expr:
     return expression.transform(replace_seq, copy=False)
 
 
+def _has_aggfunc_outside_subqueries(node: exp.Expression) -> bool:
+    """Return True iff ``node`` contains an aggregate at its own scope.
+
+    A naive ``find_all(exp.AggFunc)`` recurses into nested ``exp.Subquery``
+    nodes, which causes false positives for HAVING/projection guards: an
+    aggregate inside a *correlated* or *scalar* subquery belongs to the
+    inner Select's scope, not the outer one. Counting it as an outer-scope
+    aggregate makes the HAVING-to-WHERE transform refuse rewrites that would
+    actually be safe (and necessary, since DuckDB also rejects the original).
+
+    Implementation: clone the node, replace every ``exp.Subquery`` with a
+    ``Placeholder`` (severing recursion at the subquery boundary), then run
+    the standard recursive search on what remains.
+    """
+    clone = node.copy()
+    for sq in clone.find_all(exp.Subquery):
+        sq.replace(exp.Placeholder())
+    return any(clone.find_all(exp.AggFunc))
+
+
+def _projection_blocks_having_move(projection: exp.Expression) -> bool:
+    """Return True iff ``projection`` should block the HAVING-to-WHERE rewrite.
+
+    Two distinct conditions:
+      * The projection contains an outer-scope aggregate. Catches the
+        alias-resolution shape ``SELECT SUM(a) AS c FROM x HAVING c > 3``
+        where the bare ``c > 3`` is a disguised aggregate predicate and the
+        query is implicitly grouped, so DuckDB accepts the original HAVING.
+        Subquery-buried aggregates are excluded -- they belong to the inner
+        scope.
+      * The projection contains a window function. Snowflake permits HAVING
+        after windowing; DuckDB rejects window functions in WHERE outright
+        (``WHERE clause cannot contain window functions``). Moving HAVING to
+        WHERE here would swap one bind error for another; refusing keeps the
+        original error and signals the user must use QUALIFY or a wrapping
+        subquery. ``exp.Window`` is NOT a subclass of ``exp.AggFunc`` so this
+        needs an explicit check.
+    """
+    return _has_aggfunc_outside_subqueries(projection) or any(
+        projection.find_all(exp.Window)
+    )
+
+
+def _having_without_group_by_to_where(expression: exp.Expr) -> exp.Expr:
+    """Move a non-aggregate HAVING into WHERE when the SELECT has no GROUP BY.
+
+    Snowflake permits ``SELECT a FROM t HAVING a > 5`` (no GROUP BY, no aggregate
+    in HAVING) and treats the predicate as an implicit row filter. DuckDB rejects
+    this shape with "column must appear in the GROUP BY clause" because it
+    classifies a HAVING-bearing query as a grouped query and demands all bare
+    references be in GROUP BY. The fix is to AND-combine the HAVING expression
+    into WHERE (creating WHERE if absent) and clear HAVING.
+
+    The rewrite is gated on four conditions; all must hold:
+
+      1. The Select has a HAVING clause.
+      2. The Select has no GROUP BY clause -- queries with explicit grouping
+         are well-formed in both dialects and must not be touched.
+      3. The HAVING expression contains no aggregate functions *at its own
+         scope*. DuckDB accepts bare ``SELECT COUNT(*) FROM t HAVING COUNT(*) > 5``
+         (implicit single-row group), and moving an aggregate into WHERE would
+         cause a loud bind error ("WHERE clause cannot contain aggregates").
+         "At its own scope" means we ignore aggregates buried inside
+         subqueries -- those belong to the inner Select. See
+         ``_has_aggfunc_outside_subqueries``.
+      4. No projection blocks the move; see ``_projection_blocks_having_move``
+         for the two sub-conditions (outer-scope aggregate; window function).
+
+    Refs:
+      https://docs.snowflake.com/en/sql-reference/constructs/having
+      https://duckdb.org/docs/sql/query_syntax/having
+    """
+    if not isinstance(expression, exp.Select):
+        return expression
+
+    having = expression.args.get("having")
+    group = expression.args.get("group")
+    if having is None or group is not None:
+        return expression
+
+    having_expr = having.this
+    if having_expr is None:
+        return expression
+
+    if _has_aggfunc_outside_subqueries(having_expr):
+        return expression
+    for projection in expression.expressions or []:
+        if isinstance(projection, exp.Expression) and _projection_blocks_having_move(
+            projection
+        ):
+            return expression
+
+    new_select = expression.copy()
+    moved = having_expr.copy()
+    existing_where = new_select.args.get("where")
+    if existing_where is not None and existing_where.this is not None:
+        new_select.set(
+            "where",
+            exp.Where(this=exp.And(this=existing_where.this.copy(), expression=moved)),
+        )
+    else:
+        new_select.set("where", exp.Where(this=moved))
+    new_select.set("having", None)
+    return new_select
+
+
 def _seq_sql(self: DuckDBGenerator, expression: exp.Func, byte_width: int) -> str:
     """
     Transpile Snowflake SEQ1/SEQ2/SEQ4/SEQ8 to DuckDB.
@@ -1396,6 +1502,133 @@ def _xor_sql(self: DuckDBGenerator, expression: exp.Xor) -> str:
     )
 
 
+# Snowflake's LATERAL FLATTEN(input => arr) parses to Lateral(Explode(Kwarg('input', arr)))
+# with an auto-injected 6-column TableAlias (SEQ, KEY, PATH, INDEX, VALUE, THIS). DuckDB
+# has no FLATTEN; the closest equivalent is UNNEST(arr) WITH ORDINALITY, which exposes
+# only (value, ordinal_position). We rewrite the alias to (value, index) -- the only two
+# pseudo-columns that have direct DuckDB equivalents -- and drop the Snowflake `input =>`
+# kwarg. Other pseudo-columns (SEQ, KEY, PATH, THIS) have no positional analogue in
+# DuckDB and would surface as bind errors downstream rather than silent rename to
+# something wrong.
+#
+# The rewrite is gated on FLATTEN having ONLY the `input =>` kwarg, optionally plus
+# `outer => Boolean(true|false)` (A8 extension). When `outer => TRUE` is present, we
+# emit the LEFT JOIN LATERAL form so that NULL/empty input arrays preserve the parent
+# row (the FLATTEN OUTER analogue). When other kwargs are present (`path =>`,
+# `recursive =>`, `mode =>`, or any combination that includes them), we fall through
+# to the existing `explode_to_unnest_sql` path, which emits SQL that fails loudly in
+# DuckDB. Loud failure is preferred over silently-wrong rows for unsupported semantics.
+#
+# Refs:
+#   https://docs.snowflake.com/en/sql-reference/functions/flatten
+#   https://duckdb.org/docs/sql/query_syntax/unnest
+_SNOWFLAKE_FLATTEN_ALIAS_COLS = frozenset({"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"})
+
+
+def _snowflake_flatten_outer_kwarg(explode: exp.Expression) -> exp.Kwarg | None:
+    """Return the `outer => Boolean(...)` Kwarg if it's the SOLE extra Kwarg on
+    ``explode``, else ``None``.
+
+    Snowflake FLATTEN accepts five named arguments (input/path/outer/recursive/mode);
+    of these, only `outer => TRUE/FALSE` has a faithful DuckDB equivalent (LEFT
+    JOIN LATERAL UNNEST when TRUE, plain LATERAL UNNEST when FALSE). We detect
+    that exact shape here so the LATERAL-FLATTEN handler can pick the right
+    JOIN form. Any other extra (or a mix that includes `outer`) returns None
+    so the fall-through path -- which fails loudly in DuckDB -- runs instead.
+    """
+    extras = explode.args.get("expressions") or []
+    if len(extras) != 1:
+        return None
+    kw = extras[0]
+    if not isinstance(kw, exp.Kwarg):
+        return None
+    name = kw.this
+    if not isinstance(name, exp.Var) or name.name.upper() != "OUTER":
+        return None
+    if not isinstance(kw.expression, exp.Boolean):
+        return None
+    return kw
+
+
+def _is_snowflake_flatten_explode(explode: exp.Expression) -> bool:
+    """Detect the inner `Explode(Kwarg('INPUT', expr))` shape produced by
+    Snowflake's `FLATTEN(input => arr)`, optionally with `outer => Boolean`.
+
+    Returns True only when:
+      1. ``explode`` is an :class:`exp.Explode`.
+      2. Its sole positional arg is a Kwarg named ``INPUT`` (case-insensitive).
+      3. Extra kwargs are absent OR consist of exactly one
+         `outer => Boolean(true|false)` kwarg (handled by the LATERAL caller --
+         see :func:`_snowflake_flatten_outer_kwarg`). All other extras
+         (``path =>``, ``recursive =>``, ``mode =>``, or any combination that
+         includes them) have no faithful DuckDB equivalent and force a refusal,
+         so the fall-through emits SQL that errors loudly.
+
+    This is the shared inner predicate consumed by both:
+      * :func:`_is_snowflake_flatten_lateral` (LATERAL FLATTEN -- A2/A8 surface), and
+      * :meth:`DuckDBGenerator.tablefromrows_sql` (standalone TABLE(FLATTEN) -- A4
+        surface). The standalone TABLE(FLATTEN) surface has no left-side row to
+        preserve, so the A4 branch additionally rejects the `outer =>` shape on
+        its own (callers responsible).
+    """
+    if not isinstance(explode, exp.Explode):
+        return False
+    if not isinstance(explode.this, exp.Kwarg):
+        return False
+    kwarg_name = explode.this.this
+    if not isinstance(kwarg_name, exp.Var) or kwarg_name.name.upper() != "INPUT":
+        return False
+    extras = explode.args.get("expressions") or []
+    if not extras:
+        return True
+    # Allow exactly one extra: `outer => Boolean(true|false)`.
+    return _snowflake_flatten_outer_kwarg(explode) is not None
+
+
+def _is_snowflake_flatten_lateral(expression: exp.Lateral) -> bool:
+    """Detect Snowflake's LATERAL FLATTEN shape with the canonical 6-column alias.
+
+    Returns True only when *all* of:
+      1. The Lateral's child satisfies :func:`_is_snowflake_flatten_explode`
+         (inner FLATTEN shape with no extra kwargs).
+      2. The Lateral's TableAlias columns are a non-empty subset of the canonical
+         FLATTEN pseudo-columns {SEQ, KEY, PATH, INDEX, VALUE, THIS}. Lowercase
+         and quoted identifiers are accepted via case-folded comparison; this
+         matches the practical Snowflake convention even though strict spec
+         requires uppercase.
+
+    This narrow trigger avoids touching unrelated Explode/Unnest constructs.
+    """
+    if not _is_snowflake_flatten_explode(expression.this):
+        return False
+    alias = expression.args.get("alias")
+    if not isinstance(alias, exp.TableAlias):
+        return False
+    cols = alias.args.get("columns") or []
+    col_names = {c.name.upper() for c in cols if isinstance(c, exp.Identifier)}
+    if not col_names:
+        return False
+    return col_names.issubset(_SNOWFLAKE_FLATTEN_ALIAS_COLS)
+
+
+# DuckDB rejects MD5(<INTEGER>) ("No function matches md5(INTEGER_LITERAL)"). Snowflake
+# accepts numeric/any args by implicit string conversion. Mirror the existing _sha_sql
+# pattern (see below): only cast when the argument's type is known and is neither
+# TEXT nor BLOB. This avoids both (a) silently corrupting MD5 of binary data and
+# (b) adding noisy redundant casts when type is unknown.
+def _md5_sql(self: DuckDBGenerator, expression: exp.MD5) -> str:
+    arg = expression.this
+    if (
+        arg is not None
+        and arg.type
+        and arg.type.this != exp.DType.UNKNOWN
+        and not arg.is_type(*exp.DataType.TEXT_TYPES)
+        and not _is_binary(arg)
+    ):
+        arg = exp.cast(arg, exp.DType.VARCHAR)
+    return self.func("MD5", arg)
+
+
 def _explode_to_unnest_sql(self: DuckDBGenerator, expression: exp.Lateral) -> str:
     """Handle LATERAL VIEW EXPLODE/INLINE conversion to UNNEST for DuckDB."""
     explode = expression.this
@@ -1420,6 +1653,29 @@ def _explode_to_unnest_sql(self: DuckDBGenerator, expression: exp.Lateral) -> st
         cross_join_lateral_expr = exp.Join(this=transformed_lateral_expr, kind="CROSS")
 
         return self.sql(cross_join_lateral_expr)
+
+    if _is_snowflake_flatten_lateral(expression):
+        # Snowflake LATERAL FLATTEN(input => arr) AS f(SEQ,KEY,PATH,INDEX,VALUE,THIS)
+        #   -> DuckDB LATERAL UNNEST(arr) WITH ORDINALITY AS f(value, index)
+        # The `outer => TRUE` (A8) variant is wrapped in `LEFT JOIN ... ON TRUE`
+        # by `DuckDBGenerator.join_sql`; this transform only ever emits the inner
+        # Lateral (no JOIN keywords) so the OUTER and non-OUTER paths share the
+        # same construction here.
+        kwarg = explode.this
+        alias = expression.args["alias"]
+        # Match the Snowflake parser's auto-inject default (`_flattened`) when the
+        # source had no table-name component on the alias. Defensive: predicate
+        # only requires non-empty columns, so this normally won't fire.
+        alias_name = alias.this.copy() if alias.this else exp.to_identifier("_flattened")
+        new_lateral = exp.Lateral(
+            this=exp.Unnest(expressions=[kwarg.expression.copy()]),
+            ordinality=True,
+            alias=exp.TableAlias(
+                this=alias_name,
+                columns=[exp.to_identifier("value"), exp.to_identifier("index")],
+            ),
+        )
+        return self.sql(new_lateral)
 
     # For other cases, use the standard conversion
     return explode_to_unnest_sql(self, expression)
@@ -1615,7 +1871,9 @@ class DuckDBGenerator(generator.Generator):
         exp.Lateral: _explode_to_unnest_sql,
         exp.LogicalOr: lambda self, e: self.func("BOOL_OR", _cast_to_boolean(e.this)),
         exp.LogicalAnd: lambda self, e: self.func("BOOL_AND", _cast_to_boolean(e.this)),
-        exp.Select: transforms.preprocess([_seq_to_range_in_generator]),
+        exp.Select: transforms.preprocess(
+            [_seq_to_range_in_generator, _having_without_group_by_to_where]
+        ),
         exp.Seq1: lambda self, e: _seq_sql(self, e, 1),
         exp.Seq2: lambda self, e: _seq_sql(self, e, 2),
         exp.Seq4: lambda self, e: _seq_sql(self, e, 4),
@@ -1623,6 +1881,7 @@ class DuckDBGenerator(generator.Generator):
         exp.BoolxorAgg: _boolxor_agg_sql,
         exp.MakeInterval: lambda self, e: no_make_interval_sql(self, e, sep=" "),
         exp.Initcap: _initcap_sql,
+        exp.MD5: _md5_sql,
         exp.MD5Digest: lambda self, e: self.func("UNHEX", self.func("MD5", e.this)),
         exp.SHA: lambda self, e: _sha_sql(self, e, "SHA1"),
         exp.SHA1Digest: lambda self, e: _sha_sql(self, e, "SHA1", is_binary=True),
@@ -2974,6 +3233,36 @@ class DuckDBGenerator(generator.Generator):
         return super().tablesample_sql(expression, tablesample_keyword=tablesample_keyword)
 
     def join_sql(self, expression: exp.Join) -> str:
+        # A8: Snowflake `LATERAL FLATTEN(input => arr, outer => TRUE)` must emit
+        # `LEFT JOIN LATERAL UNNEST(arr) WITH ORDINALITY AS f(value, index) ON TRUE`
+        # so NULL/empty input arrays preserve the parent row. The Lateral's
+        # transform (`_explode_to_unnest_sql`) cannot mutate this Join's `side`
+        # *after* `op_sql` has been computed in `Generator.join_sql`, so we set
+        # `side="LEFT"` and `on=Boolean(True)` here -- before super() runs.
+        # Detection: the inner Lateral has the canonical FLATTEN shape AND
+        # contains the `outer => TRUE` kwarg. We must check the original (not yet
+        # rewritten) inner Lateral, because the transform hasn't run yet at this
+        # point.
+        this = expression.this
+        if (
+            isinstance(this, exp.Lateral)
+            and not expression.side
+            and not expression.kind
+            and not expression.args.get("on")
+            and not expression.args.get("using")
+            and _is_snowflake_flatten_lateral(this)
+        ):
+            inner_explode = this.this
+            outer_kwarg = _snowflake_flatten_outer_kwarg(inner_explode)
+            if (
+                outer_kwarg is not None
+                and isinstance(outer_kwarg.expression, exp.Boolean)
+                and outer_kwarg.expression.this is True
+            ):
+                expression.set("side", "LEFT")
+                expression.set("on", exp.Boolean(this=True))
+                return super().join_sql(expression)
+
         if (
             not expression.args.get("using")
             and not expression.args.get("on")
@@ -3749,6 +4038,54 @@ class DuckDBGenerator(generator.Generator):
             )
             return self.sql(table)
 
+        # Standalone `TABLE(FLATTEN(input => arr))` (no LATERAL): the sister case
+        # to A2's LATERAL FLATTEN rewrite. Without this branch, the kwarg leaks
+        # through as `TABLE(UNNEST(input => arr))`, which DuckDB rejects -- UNNEST
+        # has no named `input =>` parameter. Rewrite to bare
+        # `UNNEST(arr) WITH ORDINALITY AS <alias>(value, index)`, mirroring A2's
+        # alias normalization. Predicate is shared with the LATERAL path so any
+        # future extension (e.g. supporting extra FLATTEN kwargs) lands in one place.
+        #
+        # A8 caveat: `_is_snowflake_flatten_explode` now ALSO accepts an `outer =>
+        # Boolean` kwarg (handled by the LATERAL caller). Standalone TABLE(FLATTEN)
+        # has no left-side row to preserve, so we explicitly refuse the outer-bearing
+        # shape here -- it falls through to the broken-but-loud generator output.
+        explode = expression.this
+        if (
+            _is_snowflake_flatten_explode(explode)
+            and _snowflake_flatten_outer_kwarg(explode) is None
+        ):
+            kwarg = explode.this
+            existing_alias = expression.args.get("alias")
+            # Mirror A2's alias-rewrite block: only collapse to (value, index) when
+            # the user-declared alias columns are a subset of the canonical 6 (or
+            # absent). Otherwise fall through and let the loud failure surface.
+            collapse_alias = True
+            alias_name: exp.Identifier
+            if isinstance(existing_alias, exp.TableAlias):
+                cols = existing_alias.args.get("columns") or []
+                col_names = {c.name.upper() for c in cols if isinstance(c, exp.Identifier)}
+                if cols and not col_names.issubset(_SNOWFLAKE_FLATTEN_ALIAS_COLS):
+                    collapse_alias = False
+                alias_name = (
+                    existing_alias.this.copy()
+                    if existing_alias.this
+                    else exp.to_identifier("_flattened")
+                )
+            else:
+                alias_name = exp.to_identifier("_flattened")
+
+            if collapse_alias:
+                unnest = exp.Unnest(
+                    expressions=[kwarg.expression.copy()],
+                    offset=True,
+                    alias=exp.TableAlias(
+                        this=alias_name,
+                        columns=[exp.to_identifier("value"), exp.to_identifier("index")],
+                    ),
+                )
+                return self.sql(unnest)
+
         return super().tablefromrows_sql(expression)
 
     def unnest_sql(self, expression: exp.Unnest) -> str:
@@ -4068,12 +4405,21 @@ class DuckDBGenerator(generator.Generator):
 
         matches = exp.Anonymous(this="REGEXP_EXTRACT_ALL", expressions=[this, pattern])
 
+        # Wrap in CAST(... AS BIGINT): the arithmetic inside the CASE
+        # (LIST_SUM(...) etc.) widens the result to HUGEINT, which DuckDB's
+        # binder rejects for SUBSTRING(VARCHAR, HUGEINT, ...) and other
+        # consumers expecting BIGINT. Snowflake REGEXP_INSTR returns
+        # NUMBER(38,0); BIGINT (INT64) is lossless for any realistic
+        # position value (bounded by string length).
         return self.sql(
-            exp.case()
-            .when(exp.or_(*null_checks), exp.Null())
-            .when(pattern.copy().eq(exp.Literal.string("")), exp.Literal.number(0))
-            .when(exp.Length(this=matches) < occurrence, exp.Literal.number(0))
-            .else_(base_pos)
+            exp.cast(
+                exp.case()
+                .when(exp.or_(*null_checks), exp.Null())
+                .when(pattern.copy().eq(exp.Literal.string("")), exp.Literal.number(0))
+                .when(exp.Length(this=matches) < occurrence, exp.Literal.number(0))
+                .else_(base_pos),
+                exp.DataType.Type.BIGINT,
+            )
         )
 
     @unsupported_args("culture")
